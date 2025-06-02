@@ -1,4 +1,5 @@
 
+# Low-Rank Integration
 import pickle
 import copy, warnings
 from collections import deque
@@ -10,6 +11,8 @@ from pandapower.create import create_asymmetric_load, create_asymmetric_sgen
 import pandapower.topology as top
 import matplotlib.pyplot as plt
 from stable_baselines3.common.buffers import ReplayBuffer
+from peft import LoraConfig, get_peft_model
+import torch.nn as nn
 
 
 
@@ -35,6 +38,16 @@ if net.ext_grid[
     pp.create_ext_grid(net, lv_idx, vm_pu=1.0, name="DIST_SLACK_24kV")
 
 # --- 1. Imports & constants ---------------------------------------------
+import copy, warnings
+from collections import deque
+import gym, numpy as np, pandas as pd, pandapower as pp, torch
+from gym import spaces
+from pandapower.pf.runpp_3ph import runpp_3ph
+from stable_baselines3 import SAC
+from pandapower.create import create_asymmetric_load, create_asymmetric_sgen
+import pandapower.topology as top
+import matplotlib.pyplot as plt
+from stable_baselines3.common.buffers import ReplayBuffer
 
 def aggregate_replay_buffers(clients, public_agent, max_size: int = 200_000) -> ReplayBuffer:
     """
@@ -76,7 +89,7 @@ def aggregate_replay_buffers(clients, public_agent, max_size: int = 200_000) -> 
 
 PANEL_AREA  = 1.6
 STACK_LEN   = 4
-N_CLIENTS   = 5
+N_CLIENTS   = 50
 LOCAL_STEPS = 500
 ROUNDS      = 100
 LAMBDA      = 2.0      # Lyapunov gain
@@ -515,6 +528,41 @@ class Aggregator:
              # For now, we'll proceed with the potentially non-converged results but print a warning.
 
         return volts, graph, i_max, scaling_factor
+#Low Rank
+def add_lora_to_policy(sb3_policy, r=8, alpha=16, dropout=0.05):
+    """
+    Freeze the SB3 policy and inject LoRA adapters into *every* nn.Linear
+    layer that the policy contains.
+    """
+
+    # 1) freeze the backbone
+    for p in sb3_policy.parameters():
+        p.requires_grad_(False)
+
+    # 2) collect the attribute names of all Linear sub-modules
+    #    (PEFT matches on *attribute name*, not on class)
+    linear_attr_names = {
+        name.rsplit(".", 1)[-1]          # keep only the last segment
+        for name, module in sb3_policy.named_modules()
+        if isinstance(module, nn.Linear)
+    }
+    if not linear_attr_names:
+        raise RuntimeError("No nn.Linear layers found in the policy!")
+
+    print("🔍 LoRA will patch these attrs →", sorted(linear_attr_names))
+
+    lora_cfg = LoraConfig(
+        r            = r,
+        lora_alpha   = alpha,
+        lora_dropout = dropout,
+        bias         = "none",
+        target_modules = list(linear_attr_names)   # <-- critical line
+    )
+
+    # 3) swap the modules in-place
+    patched_policy = get_peft_model(sb3_policy, lora_cfg)
+    patched_policy.print_trainable_parameters()
+    return patched_policy
     
 CLIENT_KWARGS = dict(
     learning_rate   = 6e-4,
@@ -537,22 +585,30 @@ def _param_size_bytes(tree):
         else:
             pass                                      # ignore scalars / None
     return tot
+#low Rank
+def lora_only(tree: dict) -> dict:
+    "Return just the LoRA adapter tensors from an SB3 parameter tree."
+    return {k: v for k, v in tree.items() if ".lora_" in k}
+
 # --- 8. Federated helpers & loop ----------------------------------------
 class FedClient:
     def __init__(self, env):
         self.env    = env
         self.agent = SAC("MlpPolicy", env, **CLIENT_KWARGS)
+        add_lora_to_policy(self.agent.policy)  
         self.obs    = env.reset()
         self.prev_V = 0.0
         self.ev_r   = 0.0
 
 def merge_params(dicts):
-    out={}
-    for k in dicts[0]:
-        vals=[d[k] for d in dicts]
-        if isinstance(vals[0],dict): out[k]=merge_params(vals)
-        elif isinstance(vals[0],torch.Tensor): out[k]=torch.mean(torch.stack(vals),0)
-        else: out[k]=vals[0]
+    common = set.intersection(*[set(d.keys()) for d in dicts])
+    out = {}
+    for k in common:                       # only the intersection
+        vals = [d[k] for d in dicts]
+        if isinstance(vals[0], dict):
+            out[k] = merge_params(vals)
+        elif isinstance(vals[0], torch.Tensor):
+            out[k] = torch.mean(torch.stack(vals), 0)
     return out
 
 def fed_loop(
@@ -718,9 +774,11 @@ def fed_loop(
         for c in clients:
             c.agent.learn(total_timesteps=local_steps, reset_num_timesteps = False,         
                           progress_bar = False,)
-            raw_bytes = _param_size_bytes(c.agent.get_parameters())   # ⬅️ NEW ➋
+            # lora_slice = {"policy": lora_only(c.agent.get_parameters()["policy"])}
+            raw_bytes = _param_size_bytes(lora_only(c.agent.get_parameters()["policy"]))   # ⬅️ NEW Low Ranmk
+            new_ws.append(lora_only( c.agent.get_parameters()["policy"] ))
             round_upload_MiB.append(raw_bytes / (1024 ** 2))  
-            new_ws.append(c.agent.get_parameters())
+        new_ws.append(lora_only(global_agent.get_parameters()["policy"]))
         pub_agent.learn(total_timesteps=local_steps, reset_num_timesteps= False,         
                          progress_bar = False,)
         print(f"[Round {r}] mean upload = "
@@ -760,9 +818,12 @@ def fed_loop(
         print(f"→ [Round {r}] Global agent: completed {glob_steps_per_round} training steps")
 
         # (7) FedAvg over just the **clients’** + newly‐trained global params
-        new_ws.append(glob.get_parameters())
-        glob.set_parameters(merge_params(new_ws))
+        avg_lora   = merge_params(new_ws)          # <-- dict of LoRA tensors
+        full_tree  = glob.get_parameters()         # policy + optimisers
+        full_tree["policy"].update(avg_lora)       # in-place patch
+        glob.set_parameters(full_tree)             # push everything back
         print(f"→ [Round {r}] Global agent: parameters updated via FedAvg\n")
+        
 
     plt.figure(figsize=(10,4))
     plt.plot(voltage_compliance_list, label="Overall", marker="o")
@@ -820,12 +881,13 @@ if __name__=="__main__":
         batch_size=512,
         ent_coef="auto",               # learn the entropy weight
         buffer_size=200_000,
-        learning_starts=3_000,         # first update after 5k transitions
+        learning_starts=3_700,         # first update after 5k transitions
         verbose=1,
     )
+    add_lora_to_policy(global_agent.policy)
 
     # run federated co-simulation
     fed_loop(clients, global_agent, public_agent, public_env,
-             aggregator, ROUNDS, ep_len= 480, local_steps=LOCAL_STEPS)
+             aggregator, ROUNDS, ep_len= 96, local_steps=LOCAL_STEPS)
     print("✅  finished federated co-simulation with public station")
 
