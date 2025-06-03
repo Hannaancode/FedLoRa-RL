@@ -77,8 +77,8 @@ def aggregate_replay_buffers(clients, public_agent, max_size: int = 200_000) -> 
 PANEL_AREA  = 1.6
 STACK_LEN   = 4
 N_CLIENTS   = 5
-LOCAL_STEPS = 500
-ROUNDS      = 100
+LOCAL_STEPS = 200
+ROUNDS      = 20
 LAMBDA      = 2.0      # Lyapunov gain
 MAX_PLUGS   = 12       # public station plugs
 
@@ -564,7 +564,7 @@ def fed_loop(
     n_rounds,
     ep_len,
     local_steps,
-    glob_steps_per_round=3_800,
+    glob_steps_per_round=3_000,
 ):
     log = []
     voltage_compliance_list = []
@@ -629,42 +629,79 @@ def fed_loop(
             voltage_compliance_list.append(pct_overall)  # overall curve
             round_pct_list.append(pct_round) 
 
-            # — rewards
+            # —⭢**SoC maintenance metrics** (Elshazly et al. 2024; Zhang et al. 2022)
+            der_socs       = [c.env.der.soc for c in clients]
+            soc_house_mean = float(np.mean(der_socs))
+            soc_house_min  = float(np.min(der_socs))
+
+            # (2.6) — Compute household EV SoC for each client
+            ev_socs_house = []
+            for c in clients:
+                ev_soc = c.env.ev.s[2] / max(c.env.ev.s[1], 1e-3)  # energy_charged / kwh_requested
+                ev_socs_house.append(ev_soc)
+            soc_EV_house_mean = float(np.mean(ev_socs_house))
+            soc_EV_house_min  = float(np.min(ev_socs_house))
+
+            # (2.7) — Compute station EV SoC across all plugs
+            ev_socs_station = []
+            for plug in pub_env.plugs:
+                plug_soc = plug.s[2] / max(plug.s[1], 1e-3)
+                ev_socs_station.append(plug_soc)
+            soc_EV_station_mean = float(np.mean(ev_socs_station))
+            soc_EV_station_min  = float(np.min(ev_socs_station))
+
+            # (2.8) — Now build rewards
+
+            # ① Global penalties (for station and broadcasted only to station’s reward)
             global_pen_v   = -50.0 * np.mean([max(0, v-1.05)+max(0,0.95-v) for v in V.values()])
-            global_pen_amp = -5.0 * max(0, i_max-0.4)
+            global_pen_amp = -5.0  * max(0, i_max-0.4)
             pen_scale      = -10.0 * (1.0 - scale)
-            station_v_penalty     = -50.0 * np.mean([abs(v - 1.0) for v in V.values()])
-            station_amp_penalty   = -5.0 * max(0, i_max - 0.4)
-            station_scale_penalty = -10.0 * (1.0 - scale)
+
+            # ② Station EV SoC penalty & bonus
+            pen_station_low    = -50.0 * float(soc_EV_station_min < 0.17)
+            bonus_station_ev   = +10.0 * soc_EV_station_mean  # reward proportionally to mean SoC
+            station_v_penalty  = -50.0 * np.mean([abs(v - 1.0) for v in V.values()])
+            station_amp_penalty= -5.0  * max(0, i_max - 0.4)
+            station_scale_pen   = -10.0 * (1.0 - scale)
 
             station_reward = (
-                sr                       # kWh charged
-                + station_v_penalty      # voltage deviation
-                + station_amp_penalty    # ampacity
-                + station_scale_penalty  # scaling
+                sr                        # kWh delivered to station EVs
+                + station_v_penalty       # voltage dev penalty for station
+                + station_amp_penalty     # ampacity penalty 
+                + station_scale_pen       # scaling factor penalty
+                + pen_station_low         # big penalty if any station-EV SoC < 0.17
+                + bonus_station_ev        # small bonus proportional to avg station EV SoC
             )
 
+            # ③ Build each household’s reward
             house_rewards = []
             for cid, c in enumerate(clients):
-                v       = V[cid]
-                pen_v   = -5.0*(max(0, v-1.05)+max(0,0.95-v))
-                pen_amp = -5.0*max(0, i_max-0.4)
-                V_now   = 0.5*(v-1)**2
+                v   = V[cid]
+                pen_v   = -5.0 * ( max(0, v-1.05) + max(0, 0.95-v) )
+                pen_amp = -5.0 * max(0, i_max-0.4)
+                V_now   = 0.5 * (v-1)**2
                 pen_L   = LAMBDA * max(0, (V_now - c.prev_V)/0.25)
+
+                # DER low-SoC penalty
+                pen_der_low = -50.0 * float(c.env.der.soc < 0.17)
+
+                # EV SoC bonus
+                ev_soc_i    = ev_socs_house[cid]  # just retrieved above
+                bonus_ev_soc = +10.0 * ev_soc_i
+
                 rw = (
-                      + 3.0 * c.ev_r                                # reward kWh charged
-                      - 2.0 * abs(v - 1.0)                          # soft voltage penalty
-                      - 2.0 * max(0, i_max - 0.4)                   # ampacity penalty
-                      - 1.0 * abs(V_now - c.prev_V)                 # Lyapunov smoothing
-                      - 3.0 * (1.0 - scale)                         # scale penalty
-                  )
+                    + 3.0 * c.ev_r                     # reward for kWh charged to household EV
+                    - 2.0 * abs(v - 1.0)               # voltage deviation penalty
+                    - 2.0 * max(0, i_max - 0.4)        # ampacity penalty
+                    - 1.0 * abs(V_now - c.prev_V)      # Lyapunov smoothing
+                    - 3.0 * (1.0 - scale)              # scaling penalty
+                    + pen_der_low                      # penalty if DER SoC < 0.17
+                    + bonus_ev_soc                     # bonus for having EV SoC higher
+                )
                 house_rewards.append(rw)
                 c.prev_V = V_now
 
-            ...
-            # (rest of the function unchanged)
-
-
+            # (2.9) — Log everything for this step
             log.append({
                 "round": r, "step": t,
                 "min_vol": vmin, "max_vol": vmax, "i_max": i_max,
@@ -673,15 +710,24 @@ def fed_loop(
                 "avg_house_reward": np.mean(house_rewards),
                 "station_reward": station_reward,
                 "voltage_compliance": inside_band,
+                # DER SoC metrics
+                "soc_house_mean": soc_house_mean,
+                "soc_house_min":  soc_house_min,
+                # Household EV SoC metrics
+                "soc_EV_house_mean": soc_EV_house_mean,
+                "soc_EV_house_min":  soc_EV_house_min,
+                # Station EV SoC metrics
+                "soc_EV_station_mean": soc_EV_station_mean,
+                "soc_EV_station_min":  soc_EV_station_min,
             })
 
+            # (2.10) — Push transitions into each client’s replay buffer
             for cid, c in enumerate(clients):
                 g_stack = np.tile(graph, (STACK_LEN, 1))
                 tail    = c.nx.reshape(STACK_LEN, -1)[:, -17:]
-
                 obs_nxt = np.concatenate([g_stack, tail], axis=1).flatten().astype(np.float32)
                 obs_nxt = np.nan_to_num(obs_nxt)
-                # obs_nxt = (obs_nxt - obs_nxt.mean()) / (obs_nxt.std() + 1e-6)
+
                 c.agent.replay_buffer.add(
                     obs      = old_obs[cid].reshape(1, -1),
                     next_obs = obs_nxt.reshape(1, -1),
@@ -692,22 +738,24 @@ def fed_loop(
                 )
                 c.obs = obs_nxt
 
+            # (2.11) — Push station transitions
             pub_obs_batch      = pub_obs.reshape(1, -1)
             pub_next_obs_batch = sn.reshape(1, -1)
             pub_action_batch   = np.array(sa).reshape(1, -1)
             pub_reward_batch   = np.array([station_reward])
             pub_done_batch     = np.array([False])
             pub_agent.replay_buffer.add(
-                obs=pub_obs_batch,
-                next_obs=pub_next_obs_batch,
-                action=pub_action_batch,
-                reward=pub_reward_batch,
-                done=pub_done_batch,
-                infos= [{}],
+                obs    = pub_obs_batch,
+                next_obs = pub_next_obs_batch,
+                action = pub_action_batch,
+                reward = pub_reward_batch,
+                done   = pub_done_batch,
+                infos  = [{}],
             )
             pub_obs = sn
 
-        df_r   = pd.DataFrame([row for row in log if row["round"] == r])
+        # — (3) After ep_len steps, print compliance stats
+        df_r = pd.DataFrame([row for row in log if row["round"] == r])
         vol_ok = ((df_r.min_vol>=0.95)&(df_r.max_vol<=1.05)).mean()
         amp_ok = (df_r.i_max<=0.4).mean()
         print(f"Round {r:2d} → voltage OK {vol_ok:.2%}, amp OK {amp_ok:.2%}")
@@ -764,15 +812,77 @@ def fed_loop(
         glob.set_parameters(merge_params(new_ws))
         print(f"→ [Round {r}] Global agent: parameters updated via FedAvg\n")
 
-    plt.figure(figsize=(10,4))
-    plt.plot(voltage_compliance_list, label="Overall", marker="o")
-    plt.plot(round_pct_list,          label="This-round", linestyle="--")
-    plt.title("Voltage Compliance (0.95–1.05 pu)")
-    plt.xlabel("Step")
-    plt.ylabel("Compliance %")
-    plt.ylim(0,105)
-    plt.grid(True)
-    plt.legend()                       # NEW ✅ legend
+    # plt.figure(figsize=(10,4))
+    # plt.plot(voltage_compliance_list, label="Overall", marker="o")
+    # plt.plot(round_pct_list,          label="This-round", linestyle="--")
+    # plt.title("Voltage Compliance (0.95–1.05 pu)")
+    # plt.xlabel("Step")
+    # plt.ylabel("Compliance %")
+    # plt.ylim(0,105)
+    # plt.grid(True)
+    # plt.legend()                       # NEW ✅ legend
+    # plt.tight_layout()
+    # plt.show()
+    df_log = pd.DataFrame(log)
+    # mask = (df_log["round"] == 0) & (df_log["step"] == 100)
+    # selected = df_log.loc[mask, "soc_house_mean"]
+
+    # # If you expect exactly one row, extract a scalar:
+    # if not selected.empty:
+    #     val = float(selected.values[0])
+    #     print(f"Example: Round 0, step 100 → mean SoC={val:.3f}")
+    # else:
+    #     print("No matching row for round=0, step=100.")
+    # df_log.groupby("round")[["soc_house_mean","soc_house_min"]].mean().plot()
+    # plt.title("Avg & Min SoC per Round")
+    # plt.ylabel("SoC (pu)")
+    # plt.xlabel("Round")
+    # plt.show()
+    # 1) Group by round and take the mean (or min, as shown) for each metric
+    df_round = df_log.groupby("round").agg({
+        "soc_house_mean": "mean",
+        "soc_house_min":  "mean",
+        "soc_EV_house_mean": "mean",
+        "soc_EV_house_min":  "mean",
+        "soc_EV_station_mean": "mean",
+        "soc_EV_station_min":  "mean"
+    }).reset_index()
+
+    # 2) Create a single figure with two subplots:
+    #    - Top: DER SoC (mean & min)
+    #    - Bottom: EV SoC (household & station, mean & min)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    # --- Top subplot: DER SoC ---
+    ax1.plot(df_round["round"], df_round["soc_house_mean"], 
+            marker="o", label="DER Avg SoC", linewidth=2)
+    ax1.plot(df_round["round"], df_round["soc_house_min"], 
+            marker="x", label="DER Min SoC", linestyle="--", linewidth=2)
+
+    ax1.set_ylim(0, 1.05)
+    ax1.set_ylabel("DER SoC (pu)")
+    ax1.set_title("Household DER State‐of‐Charge by Round")
+    ax1.grid(True, linestyle=":", linewidth=0.5)
+    ax1.legend(loc="upper right")
+
+    # --- Bottom subplot: EV SoC ---
+    ax2.plot(df_round["round"], df_round["soc_EV_house_mean"], 
+            marker="o", label="EV (House) Avg SoC", linewidth=2)
+    ax2.plot(df_round["round"], df_round["soc_EV_house_min"], 
+            marker="x", label="EV (House) Min SoC", linestyle="--", linewidth=2)
+
+    ax2.plot(df_round["round"], df_round["soc_EV_station_mean"], 
+            marker="s", label="EV (Station) Avg SoC", linewidth=2)
+    ax2.plot(df_round["round"], df_round["soc_EV_station_min"], 
+            marker="d", label="EV (Station) Min SoC", linestyle="--", linewidth=2)
+
+    ax2.set_ylim(0, 1.05)
+    ax2.set_xlabel("Federated Round")
+    ax2.set_ylabel("EV SoC (pu)")
+    ax2.set_title("EV State‐of‐Charge (Household & Station) by Round")
+    ax2.grid(True, linestyle=":", linewidth=0.5)
+    ax2.legend(loc="upper right")
+
     plt.tight_layout()
     plt.show()
 
@@ -820,12 +930,12 @@ if __name__=="__main__":
         batch_size=512,
         ent_coef="auto",               # learn the entropy weight
         buffer_size=200_000,
-        learning_starts=3_000,         # first update after 5k transitions
+        learning_starts=2_950,         # first update after 5k transitions
         verbose=1,
     )
 
     # run federated co-simulation
     fed_loop(clients, global_agent, public_agent, public_env,
-             aggregator, ROUNDS, ep_len= 480, local_steps=LOCAL_STEPS)
+             aggregator, ROUNDS, ep_len= 96, local_steps=LOCAL_STEPS)
     print("✅  finished federated co-simulation with public station")
 
