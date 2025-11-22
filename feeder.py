@@ -9,7 +9,6 @@ Original file is located at
 
 """
 IEEE 34‑Bus unbalanced feeder – Ready for runpp_3ph
-Converted by ChatGPT on 2025‑05‑15
 
 This script rebuilds the classic IEEE‑34 feeder as a *single‑node‑per‑bus*
 model using pandapower ≥3.0 and provides the zero‑sequence data that
